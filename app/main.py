@@ -5,19 +5,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .config import MAX_CONCURRENT_ROUNDS, MAX_UPLOAD_BYTES, QUERY_TIMEOUT_SECONDS
 from .csv_io import CsvError, parse_observations_csv
-from .registry import (
-    CANCELLED,
-    FAILED,
-    SUCCEEDED,
-    RoundNotFound,
-    RoundRegistry,
-    SlotsFullError,
-)
+from .registry import RoundNotFound, RoundRegistry, SlotsFullError
 from .sql_guard import SqlRejected, validate_sql
 from .store import DataStore
 
@@ -29,6 +22,7 @@ store = DataStore()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    registry.ensure_result_dir()
     yield
     registry.shutdown()
 
@@ -144,12 +138,13 @@ def cancel_round(round_id: str) -> dict:
 
 
 @app.get("/api/rounds/{round_id}/result")
-def download_result(round_id: str) -> Response:
+def download_result(round_id: str) -> StreamingResponse:
     try:
         round_obj = registry.get(round_id)
+        fd = registry.open_result(round_id)
     except RoundNotFound:
         raise HTTPException(status_code=404, detail="轮次不存在或已被清理") from None
-    if round_obj.state != SUCCEEDED or round_obj.result_csv is None:
+    if fd is None:
         raise HTTPException(
             status_code=409,
             detail=f"轮次当前状态为 {round_obj.state}，没有可下载的结果；失败/超时不提供部分结果",
@@ -157,10 +152,15 @@ def download_result(round_id: str) -> Response:
     headers = {
         "Content-Disposition": (
             f'attachment; filename="result_{round_id[:8]}.csv"'
-        )
+        ),
+        "Content-Length": str(round_obj.result_bytes),
+        # The body is read from a stable, already-published file.
+        "X-Content-Type-Options": "nosniff",
     }
-    return Response(
-        content=round_obj.result_csv,
+    # stream_fd() closes the descriptor in its finally block, including when
+    # Starlette stops iterating after a client disconnect.
+    return StreamingResponse(
+        registry.stream_result(fd),
         media_type="text/csv; charset=utf-8",
         headers=headers,
     )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 
 # Upload limits
 MAX_UPLOAD_BYTES = 1 * 1024 * 1024  # 1 MiB CSV
@@ -25,15 +26,16 @@ TABLE_COLUMNS = ("station_id", "ts_utc", "temperature_c")
 # How many rows a worker pulls / serialises per batch.
 BATCH_SIZE = 2048
 
-# Keep finished round metadata even after their slots are released.
+# Keep finished round metadata even after their slots are released. Only the
+# most recent MAX_FINISHED_ROUNDS finished rounds remain queryable; when a
+# round is evicted its result file is deleted as well.
 MAX_FINISHED_ROUNDS = 100
 
-
-def env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+# Successful result CSVs are spooled/published on disk rather than kept in the
+# Python heap, so retaining history does not grow process memory. The directory
+# must be writable; docker-compose mounts a volume here because the container
+# root filesystem is read-only.
+RESULT_DIR = os.environ.get(
+    "RESULT_DIR",
+    os.path.join(tempfile.gettempdir(), "sql-sandbox-results"),
+)

@@ -32,6 +32,7 @@ from .config import (
     TABLE_COLUMNS,
     TABLE_NAME,
 )
+from .results import ResultStore, ResultStorageError
 from .sql_guard import SqlRejected, validate_sql
 
 # Outcome markers used by the supervisor.
@@ -43,7 +44,9 @@ MSG_TOO_LARGE = "too_large"
 @dataclass
 class WorkerResult:
     kind: str
-    csv_bytes: bytes = b""
+    # Path of the published result file; only set for MSG_DONE. The CSV never
+    # lives in the process heap once the round has finished.
+    result_path: Optional[str] = None
     row_count: int = 0
     error: str = ""
     result_bytes: int = 0
@@ -108,11 +111,18 @@ def _format_csv(columns: list[str], rows: list[tuple]) -> bytes:
 class QueryWorker(threading.Thread):
     """Runs one validated query to completion or interruption."""
 
-    def __init__(self, round_id: str, sql: str, columns: dict[str, list]) -> None:
+    def __init__(
+        self,
+        round_id: str,
+        sql: str,
+        columns: dict[str, list],
+        results: ResultStore,
+    ) -> None:
         super().__init__(name=f"query-{round_id[:8]}", daemon=True)
         self.round_id = round_id
         self._sql = sql
         self._columns = columns
+        self._results = results
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._interrupted = threading.Event()
         self._lock = threading.Lock()
@@ -165,7 +175,11 @@ class QueryWorker(threading.Thread):
                 except Exception:
                     pass
         except Exception as exc:  # noqa: BLE001 - report every failure textually
-            if self._interrupted.is_set():
+            if isinstance(exc, ResultStorageError):
+                self.result = WorkerResult(
+                    MSG_ERROR, error=f"result storage failure: {str(exc)[:300]}"
+                )
+            elif self._interrupted.is_set():
                 self.result = WorkerResult(
                     MSG_ERROR, error="query was interrupted"
                 )
@@ -174,6 +188,15 @@ class QueryWorker(threading.Thread):
                     MSG_ERROR,
                     error=f"{type(exc).__name__}: {str(exc)[:300]}",
                 )
+
+    @staticmethod
+    def _write(spool, chunk: bytes) -> None:
+        # Disk errors are surfaced as ResultStorageError so the supervisor
+        # marks the round failed instead of publishing a truncated file.
+        try:
+            spool.write(chunk)
+        except OSError as exc:
+            raise ResultStorageError(f"cannot write result spool: {exc}") from exc
 
     def _execute(self, sql: str, con: duckdb.DuckDBPyConnection) -> None:
         _build_relation(con, self._columns)
@@ -187,38 +210,67 @@ class QueryWorker(threading.Thread):
             )
             return
 
-        chunks: list[bytes] = [_csv_header(result_columns)]
-        total_bytes = len(chunks[0])
-        total_rows = 0
+        # Stream the CSV straight to disk: memory use per round is bounded by
+        # one formatted batch, not by the result size. A spool file that is
+        # never published is deleted, so failed/oversized rounds leave nothing
+        # behind and can never be downloaded.
+        spool, spool_path = self._results.new_spool(self.round_id)
+        published = False
+        try:
+            header = _csv_header(result_columns)
+            total_bytes = len(header)
+            total_rows = 0
+            self._write(spool, header)
 
-        while True:
+            while True:
+                if self._interrupted.is_set():
+                    self.result = WorkerResult(
+                        MSG_ERROR, error="query was interrupted; no partial result"
+                    )
+                    return
+                batch = cur.fetchmany(BATCH_SIZE)
+                if not batch:
+                    break
+                chunk = _format_csv(result_columns, batch)
+                total_bytes += len(chunk)
+                total_rows += len(batch)
+                if total_bytes > MAX_RESULT_BYTES:
+                    # Whole round fails; the spool is discarded below.
+                    self.result = WorkerResult(
+                        MSG_TOO_LARGE,
+                        error=(
+                            f"result CSV exceeds {MAX_RESULT_BYTES} bytes "
+                            "(8 MiB); the whole round failed and no result is kept"
+                        ),
+                        result_bytes=total_bytes,
+                    )
+                    return
+                self._write(spool, chunk)
+
             if self._interrupted.is_set():
                 self.result = WorkerResult(
                     MSG_ERROR, error="query was interrupted; no partial result"
                 )
                 return
-            batch = cur.fetchmany(BATCH_SIZE)
-            if not batch:
-                break
-            chunk = _format_csv(result_columns, batch)
-            total_bytes += len(chunk)
-            total_rows += len(batch)
-            if total_bytes > MAX_RESULT_BYTES:
-                # Whole round fails; accumulated chunks are discarded.
-                self.result = WorkerResult(
-                    MSG_TOO_LARGE,
-                    error=(
-                        f"result CSV exceeds {MAX_RESULT_BYTES} bytes "
-                        "(8 MiB); the whole round failed and no result is kept"
-                    ),
-                    result_bytes=total_bytes,
-                )
-                return
-            chunks.append(chunk)
-
-        self.result = WorkerResult(
-            MSG_DONE,
-            csv_bytes=b"".join(chunks),
-            row_count=total_rows,
-            result_bytes=total_bytes,
-        )
+            try:
+                spool.flush()
+                spool.close()
+            except OSError as exc:
+                raise ResultStorageError(
+                    f"cannot finish result spool: {exc}"
+                ) from exc
+            path = self._results.publish(spool_path, self.round_id)
+            published = True
+            self.result = WorkerResult(
+                MSG_DONE,
+                result_path=path,
+                row_count=total_rows,
+                result_bytes=total_bytes,
+            )
+        finally:
+            try:
+                spool.close()
+            except Exception:
+                pass
+            if not published:
+                self._results.discard(spool_path)

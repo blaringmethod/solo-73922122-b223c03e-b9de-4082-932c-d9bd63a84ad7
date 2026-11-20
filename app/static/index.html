@@ -67,7 +67,7 @@
 </head>
 <body>
 <header>
-  <h1>观测数据 SQL 清洗沙箱 <span style="font-size:12px;color:var(--muted)">FastAPI · DuckDB · 进程隔离</span></h1>
+  <h1>观测数据 SQL 清洗沙箱 <span style="font-size:12px;color:var(--muted)">FastAPI · DuckDB · 独立连接隔离</span></h1>
   <p>外协清洗 SQL 试跑环境：每轮仅可见所选站点数据，只读 SELECT/WITH，独立沙箱执行。</p>
 </header>
 <main>
@@ -86,7 +86,7 @@
       <span>并行名额：<b id="slotText">0 / 2</b></span>
       <span>单轮超时：<b>5 秒（硬终止）</b></span>
       <span>结果上限：<b>8 MiB（超限整轮失败）</b></span>
-      <span>隔离：<b>每轮独立子进程 + 独立内存库</b></span>
+      <span>隔离：<b>每轮独立线程 + 独立内存库</b></span>
     </div>
   </section>
 

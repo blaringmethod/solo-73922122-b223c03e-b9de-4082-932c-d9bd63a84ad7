@@ -1,6 +1,14 @@
-"""Round registry: concurrency slots, state machine and worker supervision."""
+"""Round registry: concurrency slots, state machine and worker supervision.
+
+Successful results are stored as files (see ``app.results``); a round object
+only keeps the published path and its size. Only the most recent
+``MAX_FINISHED_ROUNDS`` terminal rounds stay registered -- on eviction their
+files are unlinked, so retained history cannot grow process memory or leak
+disk space.
+"""
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -12,6 +20,7 @@ from .config import (
     MAX_FINISHED_ROUNDS,
     QUERY_TIMEOUT_SECONDS,
 )
+from .results import ResultStore
 from .worker import (
     MSG_DONE,
     MSG_ERROR,
@@ -45,7 +54,8 @@ class Round:
     sql: str
     state: str = PENDING
     error: Optional[str] = None
-    result_csv: Optional[bytes] = None
+    # Path of the published CSV on disk; never the CSV contents themselves.
+    result_path: Optional[str] = None
     result_bytes: int = 0
     row_count: int = 0
     created_at: float = field(default_factory=time.monotonic)
@@ -79,10 +89,15 @@ class Round:
 
 
 class RoundRegistry:
-    def __init__(self, max_active: int = MAX_CONCURRENT_ROUNDS) -> None:
+    def __init__(
+        self,
+        max_active: int = MAX_CONCURRENT_ROUNDS,
+        results: Optional[ResultStore] = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._rounds: dict[str, Round] = {}
         self._max_active = max_active
+        self._results = results or ResultStore()
 
     # ------------------------------------------------------------------ slots
     def active_count(self) -> int:
@@ -103,7 +118,7 @@ class RoundRegistry:
                 station_id=station_id,
                 sql=sql,
             )
-            worker = QueryWorker(round_id, sql, columns)
+            worker = QueryWorker(round_id, sql, columns, self._results)
             watchdog = threading.Timer(
                 QUERY_TIMEOUT_SECONDS, self._on_timeout, args=(round_id,)
             )
@@ -166,36 +181,61 @@ class RoundRegistry:
             if round_obj.cancel_requested:
                 round_obj.state = CANCELLED
                 round_obj.error = "round cancelled; result discarded"
-                round_obj.result_csv = None
+                self._drop_result_locked(round_obj)
             elif round_obj._timeout_happened:
                 round_obj.state = FAILED
                 round_obj.error = (
                     f"query exceeded {QUERY_TIMEOUT_SECONDS:.0f} s and was terminated; "
                     "no partial results are available"
                 )
-                round_obj.result_csv = None
+                self._drop_result_locked(round_obj)
             elif worker_result is None:
                 round_obj.state = FAILED
                 round_obj.error = "query worker exited without producing a result"
-                round_obj.result_csv = None
-            elif worker_result.kind == MSG_DONE:
-                round_obj.state = SUCCEEDED
-                round_obj.result_csv = worker_result.csv_bytes
-                round_obj.result_bytes = worker_result.result_bytes
-                round_obj.row_count = worker_result.row_count
-                round_obj.error = None
+                self._drop_result_locked(round_obj)
+            elif worker_result.kind == MSG_DONE and worker_result.result_path:
+                # The worker only reports MSG_DONE after the file was
+                # atomically published, so downloads can only ever see a
+                # complete result.
+                try:
+                    published = os.path.isfile(worker_result.result_path)
+                except OSError:
+                    published = False
+                if published:
+                    round_obj.state = SUCCEEDED
+                    round_obj.result_path = worker_result.result_path
+                    round_obj.result_bytes = worker_result.result_bytes
+                    round_obj.row_count = worker_result.row_count
+                    round_obj.error = None
+                else:
+                    # The file vanished before it could be registered; never
+                    # point a successful round at something undownloadable.
+                    round_obj.state = FAILED
+                    round_obj.error = (
+                        "result storage failure: published result file is missing"
+                    )
+                    self._drop_result_locked(round_obj)
             elif worker_result.kind == MSG_TOO_LARGE:
                 round_obj.state = FAILED
                 round_obj.error = worker_result.error
-                round_obj.result_csv = None
+                self._drop_result_locked(round_obj)
             else:
                 round_obj.state = FAILED
                 round_obj.error = worker_result.error or "query failed"
-                round_obj.result_csv = None
+                self._drop_result_locked(round_obj)
+
+            if round_obj.state != SUCCEEDED:
+                # Belt and braces: a failed/cancelled round must not leave a
+                # spool file that could later be mistaken for a result.
+                self._results.discard_spool_of(round_obj.round_id)
 
             round_obj.finished_at = time.monotonic()
             round_obj._worker = None
             round_obj._watchdog = None
+            # Keep exactly the most recent MAX_FINISHED_ROUNDS finished rounds,
+            # reclaiming the disk files of everything older. Active rounds are
+            # never candidates.
+            self._evict_finished_locked()
 
     # ------------------------------------------------------------------ cancel
     def request_cancel(self, round_id: str) -> tuple[bool, str]:
@@ -221,6 +261,13 @@ class RoundRegistry:
             "cancellation accepted; round will be marked cancelled once the worker exits"
         )
 
+    def _drop_result_locked(self, round_obj: Round) -> None:
+        """Forget and delete any result file a round may have produced."""
+        path = round_obj.result_path
+        round_obj.result_path = None
+        if path:
+            self._results.discard(path)
+
     # ------------------------------------------------------------------- reads
     def get(self, round_id: str) -> Round:
         with self._lock:
@@ -239,6 +286,26 @@ class RoundRegistry:
     def snapshot(self, round_id: str) -> dict:
         return self.get(round_id).public_dict()
 
+    def open_result(self, round_id: str) -> Optional[int]:
+        """Open a succeeded round's result file for a streaming download.
+
+        Returns ``None`` when the round exists but has no downloadable result.
+        The descriptor remains readable even if the round is evicted while the
+        response is streaming (POSIX keeps unlinked open files alive).
+        """
+        with self._lock:
+            round_obj = self._get_locked(round_id)
+            if round_obj.state != SUCCEEDED or not round_obj.result_path:
+                return None
+            return self._results.open_download(round_id)
+
+    def stream_result(self, fd: int):
+        return self._results.stream_fd(fd)
+
+    def ensure_result_dir(self) -> None:
+        """Create the result directory at startup (surfaces config errors)."""
+        self._results.ensure_directory()
+
     # ----------------------------------------------------------------- helpers
     def _evict_finished_locked(self) -> None:
         finished = [
@@ -249,6 +316,9 @@ class RoundRegistry:
         finished.sort(key=lambda r: r.finished_at or 0.0)
         for round_obj in finished[: len(finished) - MAX_FINISHED_ROUNDS]:
             self._rounds.pop(round_obj.round_id, None)
+            # Reclaim the disk space of evicted history. In-flight downloads
+            # hold their own descriptor and are unaffected by the unlink.
+            self._results.remove(round_obj.round_id)
 
     def shutdown(self) -> None:
         with self._lock:

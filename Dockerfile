@@ -8,8 +8,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Non-root user; the app keeps everything in memory and writes no files.
-RUN groupadd --system app && useradd --system --gid app --home-dir /app app
+# Non-root user. Observation data lives in memory only; successful result CSVs
+# are retained on disk (RESULT_DIR) so history does not grow process memory.
+RUN groupadd --system app && useradd --system --gid app --home-dir /app app \
+    && mkdir -p /var/lib/sql-sandbox/results \
+    && chown -R app:app /var/lib/sql-sandbox
+
+ENV RESULT_DIR=/var/lib/sql-sandbox/results
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt

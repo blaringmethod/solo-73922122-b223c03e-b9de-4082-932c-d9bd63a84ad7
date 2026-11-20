@@ -9,14 +9,25 @@ services:
     # Security hardening: no extra privileges, read-only root FS (the service
     # only uses memory), no new privileges escalation.
     read_only: true
+    # The only writable path: result CSVs are retained here (never in the
+    # Python heap) so 100 rounds of history cost no process memory.
+    volumes:
+      - results:/var/lib/sql-sandbox/results
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     mem_limit: 512m
     cpus: "2.0"
+    environment:
+      RESULT_DIR: /var/lib/sql-sandbox/results
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status==200 else 1)"]
       interval: 10s
       timeout: 3s
       retries: 3
+
+volumes:
+  results:
